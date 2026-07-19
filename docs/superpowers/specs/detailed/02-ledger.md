@@ -22,10 +22,14 @@ CREATE TABLE account (
     parent_account_id UUID REFERENCES account(id),
     institution_id    UUID REFERENCES institution(id),
     status            TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE|ARCHIVED
+    system_kind       TEXT,               -- NULL for user accounts; e.g. IN_TRANSIT (seeded, see transfers)
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (owner_id, name, parent_account_id)
 );
 CREATE INDEX account_owner_type_idx ON account (owner_id, type);
+-- Exactly one clearing account of each system kind per owner.
+CREATE UNIQUE INDEX account_system_kind_idx ON account (owner_id, system_kind)
+    WHERE system_kind IS NOT NULL;
 
 CREATE TABLE institution (
     id       UUID PRIMARY KEY,
@@ -92,7 +96,12 @@ query layer, not stored.
   `source=REVERSAL`, `reverses_txn_id` set; marks original `REVERSED`. Never mutates
   original postings. Emits `TransactionReversed`.
 - **`transfer(fromAccount, toAccount, amount, at)`** — convenience that builds a 2-posting
-  balanced transaction between two asset/liability accounts.
+  balanced transaction between two of the owner's own asset/liability accounts. No
+  income/expense account is touched, so net worth and burn are unchanged (see "Internal
+  transfers" below).
+- **`systemAccount(kind)`** — resolves (lazily seeding on first use) the owner's system
+  clearing account for a given `system_kind` (currently `IN_TRANSIT`). Used by the split
+  transfer path.
 - **`balanceAt(accountId, asOf)`** — nearest snapshot ≤ asOf + `SUM(postings)` in the gap.
   O(postings since last snapshot), not O(all history).
 - **`balances(asOf)`** / **`netPosition(asOf)`** — all accounts at a point in time.
@@ -104,6 +113,43 @@ query layer, not stored.
 with `timestamp` in `(snapshot.as_of, target]`. A monthly snapshot job (outbox consumer
 or scheduled) writes month-end snapshots. Correctness test: `balanceAt` with and without
 snapshots must agree for random dates.
+
+## Internal transfers & the In-Transit clearing account
+
+A transfer moves money between two accounts the owner controls (bank↔bank, bank↔credit
+card). It must never touch an income/expense account — net worth and burn stay unchanged.
+Two shapes:
+
+**1. Both legs known at once** (manual transfer, or both statements imported together) —
+a single balanced transaction:
+```
+transfer HDFC savings → ICICI savings, ₹10,000
+  debit  ICICI savings (ASSET)  +10,000
+  credit HDFC savings  (ASSET)  −10,000   → sum 0, net worth unchanged
+```
+Credit-card payment is the same shape with a liability leg: `debit Credit Card (LIABILITY)
++8,000` (owe less), `credit HDFC savings (ASSET) −8,000`. Card *purchases* remain expenses
+(booked when swiped); paying the bill is only this transfer — so spend is never
+double-counted.
+
+**2. Legs arrive separately** (source bank imported now, destination later) — each leg
+posts against the per-owner **`Transfers:In-Transit`** clearing account
+(`type=ASSET`, `system_kind=IN_TRANSIT`, seeded via `systemAccount(IN_TRANSIT)`):
+```
+Monday  — HDFC debit leg lands:
+  debit  Transfers:In-Transit (ASSET) +10,000   ← money is "in flight", still an asset
+  credit HDFC savings         (ASSET) −10,000   → sum 0, net worth unchanged
+
+Friday  — ICICI credit leg lands:
+  debit  ICICI savings        (ASSET) +10,000
+  credit Transfers:In-Transit (ASSET) −10,000   → In-Transit back to 0, transfer complete
+```
+A non-zero In-Transit balance = transfers whose second leg hasn't arrived yet — a useful
+"in flight" signal. The two In-Transit postings are matched and cleared by the
+**Reconciliation** context; a leg that stays in-transit beyond a threshold is surfaced as a
+reconciliation discrepancy (likely a real external payment mis-inferred as a transfer).
+Both shapes keep every intermediate state balanced and net-worth-correct, and both are
+plain append-only transactions — no special-casing of truth.
 
 ## Events emitted
 

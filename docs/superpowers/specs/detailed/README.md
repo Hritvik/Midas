@@ -46,6 +46,15 @@ it is the shared contract all other docs inherit and must not restate.
   define their own.
 - **optimization** reads everything via other contexts' public APIs
   (`AnalyticsApi`, `BudgetingApi`, `InvestmentApi`, `LedgerApi`), never their internals.
+- **Internal transfers (bank↔bank, bank↔card).** A transfer is a balanced ledger
+  transaction touching only asset/liability accounts — never income/expense — so net worth
+  and burn are unchanged, and card bill payments never double-count card purchases. When
+  both legs are known together, it's one `TRANSFER` transaction; when legs arrive in
+  separate imports, each posts as a `HALF_TRANSFER` against a per-owner
+  `Transfers:In-Transit` clearing account (system `ASSET`), which **reconciliation** pairs
+  and clears (stale legs → `STALE_IN_TRANSIT` discrepancy). Spans `02-ledger`, `03-import`,
+  `04-reconciliation`. In-Transit is a system asset, so it is included in net worth while
+  money is in flight.
 
 ## Open decisions to firm up before implementing later phases
 

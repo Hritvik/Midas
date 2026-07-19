@@ -104,7 +104,7 @@ CREATE TABLE recon_discrepancy (
     id                 UUID PRIMARY KEY,               -- v7
     owner_id           UUID NOT NULL,
     account_id         UUID NOT NULL REFERENCES account(id),
-    kind               TEXT NOT NULL,                  -- UNMATCHED_STATEMENT|UNMATCHED_LEDGER|AMOUNT_MISMATCH|DUPLICATE
+    kind               TEXT NOT NULL,                  -- UNMATCHED_STATEMENT|UNMATCHED_LEDGER|AMOUNT_MISMATCH|DUPLICATE|STALE_IN_TRANSIT
     statement_entry_id UUID,                           -- set for UNMATCHED_STATEMENT / AMOUNT_MISMATCH
     posting_id         UUID REFERENCES posting(id),    -- set for UNMATCHED_LEDGER / AMOUNT_MISMATCH
     detail             JSONB NOT NULL,                 -- amounts, dates, nearest-candidate info
@@ -338,6 +338,30 @@ Two directions, both first-class:
 `recon_match` that later cleared it (`resolved_by_match_id`) or by an explicit `IGNORED`
 decision, never by deletion — the report must always be able to show what was once out of
 balance.
+
+## Clearing split transfers (In-Transit)
+
+When the two legs of an internal transfer arrive in different imports, each is confirmed as
+a `HALF_TRANSFER` that posts one leg against the owner's `Transfers:In-Transit` clearing
+account (see `03-import.md` and `02-ledger.md`). Reconciliation owns closing the loop:
+
+- **Pairing.** On each `TransactionPosted` carrying an `IN_TRANSIT` posting, look for an
+  outstanding opposite-sign, equal-magnitude In-Transit posting within
+  `date_window_days × [ASSUMPTION: in_transit_multiplier = 3]` (transfer settlement can lag
+  more than a single statement). On a match, record a `recon_match`
+  (`match_kind=SYSTEM`, `state=CONFIRMED`, explanation *"in-transit transfer legs paired"*)
+  linking the two postings as one logical transfer for reporting. The ledger's In-Transit
+  balance already nets to zero once both legs exist; this pairing is the *explainable record*
+  of which legs cleared which, not a truth mutation.
+- **Stale legs.** An In-Transit posting still unpaired after
+  `[ASSUMPTION: in_transit_stale_days = 10]` opens a `STALE_IN_TRANSIT` discrepancy — the
+  second leg never arrived, which usually means the first leg was **not** actually a
+  transfer (e.g. a real external payment mis-inferred). Resolution: the user reclassifies it
+  (reverse the In-Transit posting in the ledger and re-book against the correct
+  expense/party) or supplies the missing leg. Reconciliation only flags; it never mutates
+  the ledger.
+- A persistently non-zero In-Transit balance is therefore always explainable as the sum of
+  open `STALE_IN_TRANSIT` discrepancies plus genuinely-in-flight (within-window) transfers.
 
 ## Immutable reconciliation history
 

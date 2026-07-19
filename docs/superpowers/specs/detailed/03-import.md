@@ -171,7 +171,7 @@ CREATE TABLE import_proposed_transaction (
     id              UUID PRIMARY KEY,               -- v7
     owner_id        UUID NOT NULL,
     batch_id        UUID NOT NULL REFERENCES import_batch(id),
-    kind            TEXT NOT NULL,                  -- SINGLE|TRANSFER
+    kind            TEXT NOT NULL,                  -- SINGLE|TRANSFER|HALF_TRANSFER
     timestamp       TIMESTAMPTZ NOT NULL,           -- effective business time
     description     TEXT NOT NULL,                  -- normalized (merchant) description
     merchant_id     UUID REFERENCES import_merchant(id),
@@ -358,7 +358,26 @@ same owner, they are inferred as a transfer when **all** hold:
 On a match: both entries get a shared `transfer_group_id`, and the propose stage emits **one**
 `kind=TRANSFER` proposal with two postings (debit one account, credit the other) instead of
 two singles. If more than two entries could pair, choose the closest-in-time exact-magnitude
-partner (greedy, nearest first); unpaired entries fall back to `SINGLE` proposals.
+partner (greedy, nearest first).
+
+**Cross-batch / cross-statement legs (the common real case).** The two legs of a transfer
+often arrive in *different* imports (HDFC statement today, ICICI statement next week), so
+in-batch pairing finds only one leg. An unpaired entry is classified two ways:
+
+- **Confidently a transfer leg** — the descriptor/counterparty indicates an own-account
+  movement (UPI/IMPS/NEFT to another of the owner's accounts, matching account tail/VPA, or
+  a user rule tagging it as a transfer) but no in-batch partner exists → propose
+  `kind=HALF_TRANSFER`: two postings, one against the real account and one against the
+  owner's `Transfers:In-Transit` clearing account (`LedgerApi.systemAccount(IN_TRANSIT)`),
+  sum-zero. Net worth stays correct while the money is "in flight".
+- **Not identifiable as a transfer** → `kind=SINGLE` as before (an expense/income proposal
+  the user can still reclassify as a transfer).
+
+When the *other* leg arrives in a later batch, it is proposed the same way (its own
+`HALF_TRANSFER` against In-Transit). **Reconciliation** then matches the two In-Transit
+postings and clears the clearing account to zero — see `04-reconciliation.md`. This keeps
+every intermediate state balanced without stateful cross-batch pairing inside import.
+`[ASSUMPTION: transfer_leg_evidence = descriptor/counterparty/user-rule]`.
 
 ## Idempotency
 
