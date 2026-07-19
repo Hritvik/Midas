@@ -6,6 +6,10 @@
 
 ---
 
+> **Detailed design:** per-context detailed design (schema, API contracts, algorithms)
+> lives in `detailed/` — start with `detailed/README.md`. This document is the north star;
+> the `detailed/` docs are the buildable specification.
+
 ## 1. Summary
 
 Midas is a personal financial **decision-support system** — not an expense tracker. Its
