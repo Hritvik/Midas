@@ -76,8 +76,13 @@ midas/
 ├─ forecasting/     Recurring projection, scenario simulation (FIRE, job loss…).
 ├─ investment/      Holdings, cost basis, XIRR, gains, SIPs, tax lots.
 ├─ optimization/    Idle cash, subscription leakage, concentration, reserves.
+├─ category/        Shared category taxonomy + resolver (added 2026-07-23).
+├─ notification/    Delivers alerts/insights/reminders (added 2026-07-23).
 └─ platform/        Cross-cutting: owner/tenant seam, idempotency store,
                     outbox dispatcher, config, auth (stub now, real later).
+
+Roadmap contexts (seams reserved 2026-07-23, full design later): liabilities (loans/
+amortization), goals, tax, copilot. See detailed/README.md and the audit doc.
 ```
 
 ### Data flow

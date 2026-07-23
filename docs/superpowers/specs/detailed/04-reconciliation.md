@@ -1,5 +1,7 @@
 # 04 — Reconciliation Context (Detailed Design)
 
+**Amended 2026-07-23** (audit remediation, Tier 0/1 — see "## Audit fixes applied" at end).
+
 **Inherits:** `00-conventions.md`. **Parent:** the design spec. The bridge between the
 outside world (imported `StatementEntry` rows) and the source of truth (`ledger`). It
 never writes truth itself — it *proposes*, a human *confirms*, and only then does it call
@@ -84,6 +86,11 @@ CREATE TABLE recon_match (
     posting_id          UUID REFERENCES posting(id),   -- the specific matched line, when known
     match_kind          TEXT NOT NULL,                 -- AUTO|MANUAL|CONFIRMED_IMPORT|SYSTEM
     state               TEXT NOT NULL,                 -- PROPOSED|CONFIRMED|REJECTED|SUPERSEDED
+    clearing_basis      TEXT,                          -- (Amended 2026-07-23) RECONCILED|PERIOD_OPEN|TXN_PENDING — the
+                                                       --   CLEARED-vs-RECONCILED discriminator stamped at decision time so
+                                                       --   the recon_entry_state fold is TOTAL from recon_match alone (audit MEDIUM).
+    match_group_id      UUID,                          -- (Amended 2026-07-23) groups the sibling rows of one many:1 / 1:many
+                                                       --   grouped match into a single logical reconciliation (audit MEDIUM).
     confidence          NUMERIC(4,3) NOT NULL,         -- [0.000, 1.000]
     score_breakdown     JSONB NOT NULL,                -- explainable component scores + weights (see below)
     explanation         TEXT NOT NULL,                 -- rendered human sentence ("Amount exact; date +1d; merchant 0.92")
@@ -135,6 +142,24 @@ CREATE TABLE recon_scoring_config (
 `currency CHAR(3)` present everywhere; INR-only in Phase 2 but multi-currency-additive.
 Matching compares magnitudes in the account's own currency; a currency mismatch can never
 score above `propose_min` (it is a hard candidate filter).
+
+**Statement-sign → ledger-sign conversion is per `account.type` (Amended 2026-07-23, audit
+MEDIUM).** The one-line "inflow + → ledger sign" rule was under-specified exactly where
+account type inverts it, which silently generated **zero** candidates for liability
+(credit-card) accounts. The conversion is now defined explicitly by the matched account's
+`type`:
+
+- **ASSET account (bank, wallet):** a statement **inflow** (`+`) increases the asset →
+  ledger **debit (+)**; a statement **outflow** (`−`) → ledger **credit (−)**. Identity map.
+- **LIABILITY account (credit card, loan):** a statement **"payment received"/credit** to the
+  card *reduces* the liability → ledger **credit (−)**; a **purchase/charge** *increases* the
+  liability → ledger **debit (+)**. The mapping is **inverted** relative to an asset account.
+
+The candidate filter `sign(p.amount_minor) = sign(e.amount_minor)` (Stage 1) runs on the
+already-converted ledger sign, so with the per-type rule above a card "payment received"
+correctly seeks a ledger credit and card accounts generate candidates like any other. The
+conversion rule applied (and the `account.type` in force) is stamped into
+`score_breakdown.signBasis` for explainability.
 
 **Append-only posture (conventions §5, §9):** `recon_match` and `recon_discrepancy` are
 append-only in spirit. Rows are inserted at proposal time; the **decision** columns
@@ -237,12 +262,31 @@ recomputation and no dependence on the current (possibly-retuned) weights.
 ```
 
 - **PENDING** — imported, not yet matched.
-- **CLEARED** — a proposed/manual match is *accepted* and links to a real ledger posting,
-  but reconciliation is not finalized (e.g. awaiting statement-period close, or the
-  posting itself is a to-be-confirmed import proposal).
+- **CLEARED** — a proposed/manual match is *accepted* and links to a **real committed ledger
+  posting**, but reconciliation is not finalized. The two entry-conditions are now recorded
+  explicitly in the match's `clearing_basis` (Amended 2026-07-23) so the projection fold is
+  total: `PERIOD_OPEN` (awaiting statement-period close) or `TXN_PENDING` (the posting's
+  ledger *transaction* is itself reconciliation-pending — e.g. one confirmed leg of a
+  split/In-Transit transfer whose loop has not closed). **Note (audit MEDIUM):** the earlier
+  wording "the posting itself is a to-be-confirmed import proposal" was incoherent —
+  `recon_match.posting_id` FKs `posting(id)`, and postings only exist as committed ledger
+  truth; an unconfirmed import proposal is an `import_proposed_posting`, never a `posting`. It
+  is reworded above to reference a real posting whose *transaction* is reconciliation-pending.
 - **RECONCILED** — terminal-happy: the statement entry is tied to a `CONFIRMED`
-  `recon_match` whose `ledger_txn_id`/`posting_id` is committed ledger truth.
+  `recon_match` (`clearing_basis=RECONCILED`) whose `ledger_txn_id`/`posting_id` is committed
+  ledger truth.
 - **DISCREPANCY** — no acceptable match; a `recon_discrepancy` row exists.
+
+**Reversal edge (Amended 2026-07-23, audit HIGH).** When the ledger emits
+`TransactionReversed` for a txn `T` that a live `CONFIRMED` match points at, the entry leaves
+`RECONCILED`/`CLEARED`: the match is superseded and the entry returns to `PENDING` (if the
+reversal was a plain booking-error undo and the entry may re-match) or `DISCREPANCY` (if no
+live candidate remains). See the consumed-events section.
+
+```
+   RECONCILED / CLEARED ──TransactionReversed(T)──▶ PENDING  (re-match possible)
+                                                └──▶ DISCREPANCY (no live candidate)
+```
 
 **`recon_match.state`** (per-match, append-only): `PROPOSED → CONFIRMED`,
 `PROPOSED → REJECTED`, and any live match `→ SUPERSEDED` when replaced. A match never goes
@@ -261,26 +305,57 @@ history in `id` (v7 time) order — a tested determinism property (conventions �
   a changed score supersedes the prior proposal. Fault-tolerant (conventions §9): a bad
   entry is quarantined as a discrepancy, never aborts the batch.
 - **`confirmMatch(matchId, reason?)`** — accepts an existing proposal against an
-  already-posted ledger posting. Marks the `recon_match` `CONFIRMED` (`decided_*` set),
-  moves `recon_entry_state` to `RECONCILED` (or `CLEARED` if the posting is itself an
-  unconfirmed import proposal), sets `current_match_id`, emits `MatchConfirmed`. One DB
-  transaction; the state change + outbox row are co-committed.
+  already-posted ledger posting. **Re-check under row lock (Amended 2026-07-23, audit HIGH):**
+  before committing, `SELECT ... FOR UPDATE` the target `posting_id` and re-assert that **no
+  other live `CONFIRMED` match already claims it** — the candidate-gen "no double-claim" rule
+  ran earlier when the posting was unclaimed (a TOCTOU gap), so it MUST be re-verified here;
+  reject with `RECON_POSTING_ALREADY_MATCHED` if the posting is now claimed. On success, marks
+  the `recon_match` `CONFIRMED` (`decided_*` set), stamps `clearing_basis`
+  (`RECONCILED`/`PERIOD_OPEN`/`TXN_PENDING`), moves `recon_entry_state` to `RECONCILED` (or
+  `CLEARED` when `clearing_basis ≠ RECONCILED`), sets `current_match_id`, **supersedes ALL
+  other live (`PROPOSED`) sibling proposals for the same entry** (an entry can hold several
+  `≥ propose_min` proposals — leaving them live would dangle orphan proposals against a
+  reconciled entry), and emits `MatchConfirmed`. One DB transaction; the state change + outbox
+  row are co-committed.
 - **`confirmImportedTransaction(cmd)`** — *the Phase 2 headline flow.* For a proposed
-  import transaction that has **no** ledger posting yet: (1) calls
-  `LedgerApi.postTransaction(cmd)` (single currency, sum-zero, owner-scoped — ledger
+  import transaction that has **no** ledger posting yet:
+  **(0) Precondition — lock & guard (Amended 2026-07-23, audit CRITICAL).** *Before calling
+  the ledger*, `SELECT ... FOR UPDATE` the entry's `recon_entry_state` and **reject with
+  `RECON_ENTRY_ALREADY_RECONCILED` unless the entry is still `PENDING` and has no live
+  `CONFIRMED` match**. Without this, an entry the user already reconciled by a different route
+  (e.g. a manually-booked ledger txn `T1` cleared via `confirmMatch`) would be posted a
+  **second** time — the proposal's deterministic `idempotency_key` differs from `T1`'s manual
+  key, so the ledger cannot dedup it, and truth double-counts the same real-world event. The
+  guard runs inside the same DB tx as the ledger call. Then:
+  (1) calls `LedgerApi.postTransaction(cmd)` (single currency, sum-zero, owner-scoped — ledger
   enforces its own invariants and idempotency), then (2) records a `recon_match`
-  (`match_kind=CONFIRMED_IMPORT`, `state=CONFIRMED`, `confidence=1.000`, breakdown =
-  *"user-confirmed import"*) linking the new `ledger_txn_id`/`posting_id` to the
-  `statement_entry_id`, and (3) sets `recon_entry_state=RECONCILED`. Emits `MatchConfirmed`.
+  (`match_kind=CONFIRMED_IMPORT`, `state=CONFIRMED`, `confidence=1.000`,
+  `clearing_basis=RECONCILED`, breakdown = *"user-confirmed import"*) linking the new
+  `ledger_txn_id`/`posting_id` to the `statement_entry_id`, and (3) sets
+  `recon_entry_state=RECONCILED`. Emits `MatchConfirmed`.
   Idempotent via the caller's `Idempotency-Key` (conventions §7) *and* the ledger's own
   `idempotency_key`, so a retry never double-posts and never creates a second match. See
   the flow detail below.
 - **`rejectMatch(matchId, reason)`** — marks the proposal `REJECTED`, leaves the entry
   `PENDING`, emits `MatchRejected`. The rejected row stays (history).
 - **`manualMatch(statementEntryId, postingId, reason)`** — user forces a link the scorer
-  missed/under-scored. Inserts a `CONFIRMED` `recon_match` (`match_kind=MANUAL`,
-  `confidence` recorded as computed but decision is human), supersedes any live proposal,
-  moves the entry to `CLEARED`/`RECONCILED`.
+  missed/under-scored. **Same row-lock re-check as `confirmMatch` (Amended 2026-07-23, audit
+  HIGH):** `FOR UPDATE` the `posting_id` and reject with `RECON_POSTING_ALREADY_MATCHED` if a
+  live `CONFIRMED` match already claims it. Inserts a `CONFIRMED` `recon_match`
+  (`match_kind=MANUAL`, `confidence` recorded as computed but decision is human, `clearing_basis`
+  stamped), **supersedes ALL live sibling proposals for the entry**, moves the entry to
+  `CLEARED`/`RECONCILED`.
+- **`groupedMatch(statementEntryIds[], postingIds[], reason)`** — *(Amended 2026-07-23, audit
+  MEDIUM)* the many:1 / 1:many primitive. A legitimately split settlement (one bank debit
+  recorded as two statement lines, or two ledger transactions for one statement line) has no
+  exact single-posting match and would otherwise become a false
+  `UNMATCHED_STATEMENT`/`UNMATCHED_LEDGER` discrepancy. This forces one logical reconciliation
+  spanning the set: it inserts one `CONFIRMED` `recon_match` per (entry, posting) pair sharing
+  a single `match_group_id`, requires the **signed magnitudes of the two sides to net to
+  equal** (the group is balanced), applies the same row-lock double-claim re-check to every
+  posting in the set, supersedes sibling proposals on every entry, and moves each entry to
+  `CLEARED`/`RECONCILED`. Reports and the projection fold treat a `match_group_id` cohort as
+  one transfer/settlement.
 - **`unmatch(statementEntryId, reason)`** — supersedes the live match (new
   `SUPERSEDED`-marking row), returns the entry to `PENDING`. Never deletes the prior match.
 - **`detectDiscrepancies(accountId, periodEnd)`** — for a closed statement period, opens
@@ -303,21 +378,45 @@ user reviews proposed import txn for StatementEntry e
         │
         ▼
 ReconciliationApi.confirmImportedTransaction(cmd, Idempotency-Key)
-        │   (one @Transactional boundary in reconciliation)
-        ├─▶ LedgerApi.postTransaction(cmd)            // ledger's OWN tx: postings (truth) + TransactionPosted outbox row
-        │        └─ returns ledgerTxnId, postingIds   //   (ledger enforces sum-zero, single-currency, idempotency)
-        ├─▶ INSERT recon_match(state=CONFIRMED, match_kind=CONFIRMED_IMPORT,
+        │   (ONE physical DB tx — ledger post + recon writes + idempotency finalize all co-commit; conventions §7)
+        ├─▶ [0] SELECT recon_entry_state FOR UPDATE          // (Amended 2026-07-23) lock e; reject
+        │        └─ RECON_ENTRY_ALREADY_RECONCILED unless PENDING & no live CONFIRMED match
+        ├─▶ LedgerApi.postTransaction(cmd)            // SAME physical tx: postings (truth) + TransactionPosted outbox row
+        │        └─ returns ledgerTxnId, postingIds   //   idempotent replay returns the ORIGINAL ids (conventions §7)
+        ├─▶ INSERT recon_match(state=CONFIRMED, match_kind=CONFIRMED_IMPORT, clearing_basis=RECONCILED,
         │        confidence=1.000, ledger_txn_id, posting_id, statement_entry_id, explanation='user-confirmed import')
         ├─▶ UPDATE recon_entry_state → RECONCILED, current_match_id=<new>
-        └─▶ OutboxWriter.append(MatchConfirmed)       // same reconciliation DB tx
+        ├─▶ OutboxWriter.append(MatchConfirmed)       // same DB tx
+        └─▶ FINALIZE Idempotency-Key result           // same DB tx (conventions §7 same-tx finalize)
 ```
+
+**Atomicity (Amended 2026-07-23, audit HIGH — conventions §7 cross-module writes).** The
+ledger post and the `recon_match` write share the **same physical DB transaction**: this is a
+cross-module write where reconciliation posts to the ledger as part of its own write, so per
+conventions §7 the ledger post participates in reconciliation's tx — they commit or abort
+together. There is no window in which the posting is visible without its match. Two guarantees
+this relies on, now made explicit:
+
+- **`postTransaction` idempotent replay returns the original `ledgerTxnId` + `postingIds`**
+  (conventions §7 "look up the pre-existing txn by shared key and attach — never re-post"), so
+  a retry after a partial failure re-attaches to the original posting rather than orphaning it.
+- **The outer `Idempotency-Key` is finalized in that same tx** (conventions §7 same-tx
+  finalize), never at request entry — so a crash can't leave a committed posting with a
+  "complete" idempotency record but no `recon_match` (the entry-stuck-`PENDING` /
+  false-`UNMATCHED_LEDGER` failure mode).
+
+**`TransactionPosted` consumer skips already-matched postings (Amended 2026-07-23).** Because
+reconciliation also *consumes* `TransactionPosted` to re-run `proposeMatches`, the consumer
+MUST **skip any posting that already carries a live `CONFIRMED` match or was posted by a
+`CONFIRMED_IMPORT` confirm** — otherwise it could propose a competing `AUTO` match on the very
+posting the confirm just claimed. With the single-tx confirm above, the posting and its
+`CONFIRMED_IMPORT` match become visible atomically, so the consumer either sees neither or
+both and never proposes against a claimed posting.
 
 **Idempotency & failure posture:** the outer `Idempotency-Key` (platform store) makes the
 whole confirm replay-safe; the ledger's `idempotency_key` guarantees the *posting* side is
-posted at-most-once even if reconciliation retries after a partial failure. If
-`postTransaction` succeeds but the reconciliation commit fails, the retry finds the ledger
-txn already exists (idempotent) and only (re)writes the match — no duplicate posting. Fail
-closed on the ledger call, fault-tolerant on the batch around it (conventions §9).
+posted at-most-once even if reconciliation retries after a partial failure. Fail closed on the
+ledger call, fault-tolerant on the batch around it (conventions §9).
 
 ## Discrepancy handling
 
@@ -346,20 +445,40 @@ a `HALF_TRANSFER` that posts one leg against the owner's `Transfers:In-Transit` 
 account (see `03-import.md` and `02-ledger.md`). Reconciliation owns closing the loop:
 
 - **Pairing.** On each `TransactionPosted` carrying an `IN_TRANSIT` posting, look for an
-  outstanding opposite-sign, equal-magnitude In-Transit posting within
-  `date_window_days × [ASSUMPTION: in_transit_multiplier = 3]` (transfer settlement can lag
-  more than a single statement). On a match, record a `recon_match`
-  (`match_kind=SYSTEM`, `state=CONFIRMED`, explanation *"in-transit transfer legs paired"*)
+  outstanding opposite-sign, equal-magnitude In-Transit posting within the **pairing window**
+  `pairing_window = max(date_window_days × [ASSUMPTION: in_transit_multiplier = 3],
+  in_transit_stale_days)` (transfer settlement can lag more than a single statement; the
+  `max` guarantee is explained under "Stale legs" below).
+  **Corroboration key (Amended 2026-07-23, audit HIGH).** Amount + sign + window is
+  **insufficient** when two equal-magnitude transfers are in flight at once (HDFC→ICICI and
+  SBI→Axis both `±10,000`) — it can pair the wrong legs, and although the ledger still nets to
+  zero, the *explainable record of which legs cleared which* (the whole point) would be false.
+  A candidate opposite leg therefore additionally requires **corroboration**: a shared
+  `transfer_group_id` when import supplied one (the strong key), else counterparty /
+  account-tail agreement (as import's transfer inference already does, `03-import.md`). When
+  **more than one** opposite leg still qualifies, apply a **greedy nearest-in-time tie-break**
+  (pair with the closest-in-time qualifying leg); if two candidates remain within an
+  `[ASSUMPTION: in_transit_ambiguity_days = 1]` tie, do **not** auto-pair — flag for manual
+  choice (the In-Transit analogue of the scorer's ambiguity guard). On a match, record a
+  `recon_match` (`match_kind=SYSTEM`, `state=CONFIRMED`, `match_group_id` shared by the paired
+  legs, explanation *"in-transit transfer legs paired"* with the corroboration key noted)
   linking the two postings as one logical transfer for reporting. The ledger's In-Transit
   balance already nets to zero once both legs exist; this pairing is the *explainable record*
   of which legs cleared which, not a truth mutation.
 - **Stale legs.** An In-Transit posting still unpaired after
   `[ASSUMPTION: in_transit_stale_days = 10]` opens a `STALE_IN_TRANSIT` discrepancy — the
   second leg never arrived, which usually means the first leg was **not** actually a
-  transfer (e.g. a real external payment mis-inferred). Resolution: the user reclassifies it
-  (reverse the In-Transit posting in the ledger and re-book against the correct
-  expense/party) or supplies the missing leg. Reconciliation only flags; it never mutates
-  the ledger.
+  transfer (e.g. a real external payment mis-inferred). **Window constraint + re-attempt
+  (Amended 2026-07-23, audit MEDIUM):** the pairing window is constrained
+  `pairing_window ≥ in_transit_stale_days` (the `max(...)` above), and **before** opening a
+  `STALE_IN_TRANSIT` discrepancy the stale check **re-attempts pairing against ALL outstanding
+  In-Transit postings regardless of the arrival-time window**. Otherwise a leg that genuinely
+  arrived in the gap between a narrower pairing window and the stale threshold (e.g. 9.5d
+  arrival vs a 9d window, 10d stale) would never pair yet trip stale — leaving a `STALE_IN_TRANSIT`
+  row OPEN while In-Transit already nets to zero, contradicting the invariant below.
+  Resolution: the user reclassifies it (reverse the In-Transit posting in the ledger and
+  re-book against the correct expense/party) or supplies the missing leg. Reconciliation only
+  flags; it never mutates the ledger.
 - A persistently non-zero In-Transit balance is therefore always explainable as the sum of
   open `STALE_IN_TRANSIT` discrepancies plus genuinely-in-flight (within-window) transfers.
 
@@ -376,7 +495,12 @@ account (see `03-import.md` and `02-ledger.md`). Reconciliation owns closing the
   WHERE statement_entry_id = ? ORDER BY id` (v7 = chronological).
 - `recon_entry_state` is a **projection** of that history and is rebuildable: dropping it
   and folding `recon_match` in `id` order reproduces identical current state — a tested
-  determinism property (conventions §8, §10).
+  determinism property (conventions §8, §10). **Total fold (Amended 2026-07-23, audit
+  MEDIUM):** the CLEARED-vs-RECONCILED distinction is no longer derived from external facts (a
+  replay cannot know whether a statement period was closed at the time). Each `CONFIRMED`
+  match stamps `clearing_basis` (`RECONCILED`/`PERIOD_OPEN`/`TXN_PENDING`) at decision time, so
+  the fold reads the entry status **entirely from `recon_match`** and is total — no
+  under-determined replay.
 
 ## Events consumed / emitted (outbox)
 
@@ -385,7 +509,21 @@ event_id)`, conventions §6):
 
 - **`TransactionPosted`** (from ledger) — a new posting exists; trigger candidate
   re-evaluation for that account/date so late-arriving ledger entries can clear pending
-  statement entries, and to detect `UNMATCHED_LEDGER` discrepancies.
+  statement entries, and to detect `UNMATCHED_LEDGER` discrepancies. **(Amended 2026-07-23,
+  audit HIGH):** the consumer **skips any posting that already carries a live `CONFIRMED`
+  match or was posted by a `CONFIRMED_IMPORT` confirm** — with the single-tx confirm flow the
+  posting and its match are visible atomically, so the consumer never proposes a competing
+  `AUTO` match against a posting the confirm already claimed.
+- **`TransactionReversed`** (from ledger — Amended 2026-07-23, audit HIGH; conventions §10) —
+  the ledger reversed a txn `T` (a new negated transaction posted; `REVERSED` derived from the
+  reversing row, 02-ledger / conventions §5, §10). Reconciliation locates any **live
+  `CONFIRMED` match on `T`'s postings**, inserts a **superseding** row (never mutates the
+  matched row), clears `current_match_id`, and moves the entry back to **`PENDING`** (so it can
+  re-match a corrected posting) or **`DISCREPANCY`** (if no live candidate remains) — the
+  matched truth no longer stands, so leaving the entry `RECONCILED` would falsely assert it
+  reconciles against valid truth. Idempotent on `(consumer_name, event_id)` like every
+  consumer. (The reversal's own negated posting arrives via `TransactionReversed`, not
+  `TransactionPosted`, so it is deliberately not fed to `proposeMatches` as a fresh candidate.)
 - **`TransactionProposed`** (from import — the real event, per `03-import.md`) — a new
   proposed balanced transaction exists for a staged statement entry. Reconciliation seeds
   a `recon_entry_state` `PENDING` row keyed on the proposal's `statementEntryId`, then runs
@@ -420,6 +558,7 @@ writes truth.
 | POST | `/api/v1/reconciliation/matches/{matchId}/reject` | reject a proposal (reason) |
 | POST | `/api/v1/reconciliation/confirm-import` | confirm proposed import txn → `LedgerApi.postTransaction` + record match (Idempotency-Key required) |
 | POST | `/api/v1/reconciliation/manual-match` | force `{statementEntryId, postingId}` link |
+| POST | `/api/v1/reconciliation/grouped-match` | force a balanced many:1 / 1:many `{statementEntryIds[], postingIds[]}` group (Amended 2026-07-23) |
 | POST | `/api/v1/reconciliation/entries/{statementEntryId}/unmatch` | supersede live match, back to PENDING |
 | GET | `/api/v1/reconciliation/accounts/{accountId}/discrepancies` | list open discrepancies |
 | POST | `/api/v1/reconciliation/discrepancies/{id}/resolve` | resolve / ignore a discrepancy |
@@ -457,4 +596,38 @@ require `Idempotency-Key`.
   `TransactionProposed` produce no duplicate state (dedup on `(consumer_name, event_id)`).
 - **API contract tests:** each endpoint — happy path, validation (422), and error `code`
   (e.g. confirming an already-decided match → `RECON_MATCH_ALREADY_DECIDED`).
+- **Confirm-import precondition (Amended 2026-07-23):** an entry already `RECONCILED` by a
+  prior `confirmMatch` rejects `POST /confirm-import` with `RECON_ENTRY_ALREADY_RECONCILED`
+  and posts **nothing** to the ledger (no second txn for the same event).
+- **Confirm-import atomicity (Amended 2026-07-23):** the ledger post and `recon_match` write
+  co-commit in one physical tx; a `TransactionPosted` delivered mid-confirm never yields a
+  competing `AUTO` match on the confirmed posting; a crash after the ledger post replays to the
+  original `ledgerTxnId`/`postingIds` and writes exactly one match (no orphan posting).
+- **Double-claim under lock (Amended 2026-07-23):** two entries proposed against one posting —
+  confirming the second rejects with `RECON_POSTING_ALREADY_MATCHED`; confirming an entry
+  supersedes its sibling live proposals.
+- **Reversal (Amended 2026-07-23):** `TransactionReversed` on a reconciled txn supersedes the
+  live match and returns the entry to `PENDING`/`DISCREPANCY`; idempotent on redelivery.
+- **In-Transit pairing (Amended 2026-07-23):** two equal-magnitude transfers in flight pair by
+  corroboration key (transfer_group_id / counterparty), not amount alone; ambiguous legs flag
+  for manual choice; a leg arriving inside the stale threshold pairs on the pre-stale
+  re-attempt and never trips a false `STALE_IN_TRANSIT`.
+- **Liability sign (Amended 2026-07-23):** a credit-card "payment received" statement entry
+  generates ledger-credit candidates (per-`account.type` conversion), not zero candidates.
+- **Grouped match (Amended 2026-07-23):** a split settlement (1 debit ↔ 2 statement lines)
+  reconciles as one balanced `match_group_id` cohort instead of two false discrepancies.
 ```
+
+## Audit fixes applied
+
+Amendments made 2026-07-23 in response to `../2026-07-23-audit-and-opportunities.md` and the
+adversarial review of this context. Each maps to the finding it closes:
+
+| # | Sev | Finding | Fix in this doc |
+|---|---|---|---|
+| 1 | CRITICAL | `confirmImportedTransaction` had no already-matched precondition → double-post of the same event under a different idempotency key | Added **step 0**: `SELECT ... FOR UPDATE` `recon_entry_state`, reject `RECON_ENTRY_ALREADY_RECONCILED` unless still `PENDING` with no live `CONFIRMED` match, *before* the ledger call, in the same tx (`confirmImportedTransaction`, flow diagram) |
+| 2 | HIGH | Confirm spanned two DB txs → orphan postings / competing matches; atomicity+idempotency claims unstated | Ledger post now shares the **same physical DB tx** as the `recon_match` write (conventions §7); idempotent `postTransaction` replay returns the original `ledgerTxnId`/`postingIds`; outer `Idempotency-Key` finalized in that same tx; `TransactionPosted` consumer **skips** postings already carrying a live `CONFIRMED`/`CONFIRMED_IMPORT` match |
+| 3 | HIGH | TOCTOU double-claim: two entries `CONFIRMED` against one posting; sibling proposals dangle | `confirmMatch`/`manualMatch` **re-check under row lock** that `posting_id` has no live `CONFIRMED` match (`RECON_POSTING_ALREADY_MATCHED`); both **supersede all sibling live proposals** for the entry at confirm |
+| 4 | HIGH | Reversed txn left its entry falsely `RECONCILED` — `TransactionReversed` not consumed | Now **consumes `TransactionReversed`** (conventions §10): supersedes the live match on the reversed txn's postings and moves the entry back to `PENDING`/`DISCREPANCY`; state-machine reversal edge added |
+| 5 | HIGH | In-Transit pairing linked the wrong leg when two equal-magnitude transfers were in flight | Pairing now requires **`transfer_group_id` or counterparty/account-tail corroboration**; adds a **greedy nearest-in-time tie-break** + **ambiguity guard** when >1 opposite leg qualifies |
+| 6 | MEDIUM | Stale window > pairing window; under-determined CLEARED/RECONCILED fold; incoherent CLEARED branch; liability sign; no N:M path | `pairing_window ≥ in_transit_stale_days` + **re-attempt pairing before opening `STALE_IN_TRANSIT`**; persisted **`clearing_basis`** discriminator makes the projection fold total; CLEARED reworded to a real posting whose *transaction* is reconciliation-pending; **per-`account.type` sign conversion** (asset vs liability) so card accounts generate candidates; **`groupedMatch`** primitive + `match_group_id` for many:1 / 1:many |

@@ -3,6 +3,9 @@
 Broad-first detailed design for every bounded context. Read `00-conventions.md` first —
 it is the shared contract all other docs inherit and must not restate.
 
+**Amended 2026-07-23** — Tier 0 + Tier 1 audit remediation applied across all contexts; two
+new contexts added (`category`, `notification`). See `../2026-07-23-audit-and-opportunities.md`.
+
 | Doc | Context | Phase | Owns truth? |
 |---|---|---|---|
 | `00-conventions.md` | Shared design contract | — | — |
@@ -11,57 +14,77 @@ it is the shared contract all other docs inherit and must not restate.
 | `03-import.md` | Ingest → staged entries → proposed txns | 2 | no (staging) |
 | `04-reconciliation.md` | Match/confirm proposals into the ledger | 2 | no (proposes) |
 | `05-analytics.md` | Net worth, burn, runway projections | 3 | no (read model) |
+| `10-category.md` | **Shared category taxonomy + resolver** | 3 | no (dimension) |
+| `11-notification.md` | **Delivers alerts/insights/reminders** | 3 | no (consumer) |
 | `06-budgeting.md` | Envelopes, safe-to-spend | 4 | no (read model) |
 | `07-forecasting.md` | Recurring projection, scenarios | 4 | no (derived) |
 | `08-investment.md` | Holdings, XIRR, tax lots | 5 | no (mirrors cash to ledger) |
 | `09-optimization.md` | Insights / recommendations | 6 | no (read model) |
 
-## Invariants that hold across every doc (verified in the reconciliation pass)
+**Roadmap contexts (seams reserved in Tier 0, full design in their own phase):**
+`liabilities` (loans/amortization), `goals`, `tax` (capital-gains/80C/advance-tax), `copilot`
+(grounded AI). See the audit doc's Tier 2/3.
 
-1. **One source of truth.** Only `ledger` owns financial truth. The only contexts that
-   write it are (a) `reconciliation` (confirming proposals) and (b) `investment`
-   (mirroring investment cash legs) — both exclusively via `LedgerApi.postTransaction` /
-   `reverseTransaction`. No context writes ledger tables directly. Analytics, budgeting,
-   forecasting, and optimization only *read* via `LedgerApi` and their own projections.
-2. **Money is always `BIGINT` minor units + currency.** No floats anywhere. Investment
-   quantities are integers scaled by 1e8.
-3. **Projections are rebuildable** from the outbox (deterministic replay) — a tested
-   property in analytics, budgeting, reconciliation.
-4. **Idempotency end-to-end** — a single source row can never become two ledger
-   transactions (import's deterministic proposal key flows through reconciliation into the
-   ledger's idempotency key).
+## Invariants that hold across every doc
+
+1. **One source of truth.** Only `ledger` owns financial truth. The only writers are
+   `reconciliation` (confirming proposals) and `investment` (mirroring cash legs) — both via
+   `LedgerApi.postTransaction`/`reverseTransaction` in the **same physical DB transaction**
+   (conventions §7). Everyone else only reads.
+2. **Money is `BIGINT` minor units + currency; quantities are integers scaled 1e8.** Aggregate
+   cost/valuation is stored as a **total**, never a rounded per-unit multiplied back
+   (conventions §2).
+3. **Net worth = Σ assets − Σ liabilities + Σ unrealized gain**, over leaf accounts,
+   investments at cost + gain added exactly once (conventions §9). One canonical formula in
+   ledger/analytics/investment.
+4. **Corrections:** reversals are correction-time and derive `REVERSED` from a reversing row
+   (no mutable status); refunds are ordinary expense-credit transactions. Signed folds net them
+   out (conventions §10, §8).
+5. **Projections are rebuildable** from the durable outbox (deterministic replay), incl. a
+   post-then-reverse-nets-to-zero test on every signed fold.
+6. **Outbox delivery is per-`(event,consumer)`** with a contiguous low-water offset and
+   owner-scoped async dispatch; idempotency is **reserve-first** (conventions §6, §7).
+7. **Time is owner-local** (Asia/Kolkata) for all day/week/month/FY bucketing; storage UTC
+   (conventions §3).
 
 ## Cross-context seams (reconciled)
 
-- **import → reconciliation.** Reconciliation's trigger is import's real
-  **`TransactionProposed`** event (plus `ImportBatchCompleted` as a UI signal). An earlier
-  draft assumed a `StatementEntryStaged` event and different `StatementEntry` field names;
-  those were reconciled to import's actual `import_statement_entry` columns (`booked_at`,
-  `raw_description`, `merchant_id`, `batch_id`) and its `import_proposed_transaction`
-  handoff. See the dependency note in `04-reconciliation.md`.
+- **import → reconciliation.** Trigger is import's `TransactionProposed`; the confirm flow is a
+  single physical tx with an already-matched precondition (no double-post). Proposal
+  idempotency key folds occurrence identity; `reparse` forbidden once proposals are emitted.
 - **ledger → analytics / budgeting / forecasting / reconciliation.** All consume
-  `TransactionPosted` / `TransactionReversed` from the outbox.
-- **Category dimension** is owned by **analytics** (`05`): account-mapping primary, optional
-  transaction tag. Budgeting and forecasting consume that same dimension — they do not
-  define their own.
-- **optimization** reads everything via other contexts' public APIs
-  (`AnalyticsApi`, `BudgetingApi`, `InvestmentApi`, `LedgerApi`), never their internals.
-- **Internal transfers (bank↔bank, bank↔card).** A transfer is a balanced ledger
-  transaction touching only asset/liability accounts — never income/expense — so net worth
-  and burn are unchanged, and card bill payments never double-count card purchases. When
-  both legs are known together, it's one `TRANSFER` transaction; when legs arrive in
-  separate imports, each posts as a `HALF_TRANSFER` against a per-owner
-  `Transfers:In-Transit` clearing account (system `ASSET`), which **reconciliation** pairs
-  and clears (stale legs → `STALE_IN_TRANSIT` discrepancy). Spans `02-ledger`, `03-import`,
-  `04-reconciliation`. In-Transit is a system asset, so it is included in net worth while
-  money is in flight.
+  `TransactionPosted` **and `TransactionReversed`** from the outbox.
+- **Category** is owned by the dedicated **`category/` context** (`10`): one taxonomy +
+  `CategoryResolver` (tag → account map → merchant rule → uncategorized). Analytics, budgeting,
+  forecasting, import all consume it; none defines its own. Transfers resolve to null category.
+- **Notification** (`11`) is the sole delivery consumer of `budget_alert`/`InsightRaised`/
+  `DiscrepancyFlagged`/due-reminders/DEAD-letter — closing the "records go nowhere" gap.
+- **optimization** reads peers only via their public APIs (incl. a new `ObligationsApi` so
+  earmarked cash isn't flagged deployable); account rate/yield come from the reserved
+  financial-product metadata seam (suppress when absent, never default 0).
+- **Internal transfers** unchanged in spirit: balanced asset/liability transaction; separate-leg
+  transfers use `HALF_TRANSFER` against `Transfers:In-Transit`, paired/cleared by reconciliation
+  with counterparty corroboration.
 
-## Open decisions to firm up before implementing later phases
+## Reserved seams (design now, full build later — conventions §12)
 
-- **Category ownership vs. tagging.** Analytics derives category from account mapping now;
-  if user-level transaction tagging is wanted, decide whether the tag lives on the ledger
-  transaction (affects `02`) or stays a projection-side concern. Deferred to Phase 3.
-- **Auto-confirm reconciliation.** Phase 2 surfaces high-confidence matches but does not
-  silently post them; auto-clear is a Phase-2+ opt-in.
-- **External price feeds** (investment) and **non-CSV import adapters** are designed but
-  deferred; each is additive (no schema change).
+- **Account financial-product metadata** (`rate_bps`, `tenure_months`, `credit_limit_minor`,
+  `yield_bps`, `statement_day`, `due_day`) on `account` — feeds loans + `IDLE_CASH`/`DEBT_OPT`.
+- **`manual_valuation`** mark on any asset account — feeds mark-to-market net worth for
+  illiquid assets (real estate, gold, EPF/PPF/NPS).
+- **Recurring-obligation registry** interface — import detects into it; forecasting projects;
+  budgeting reserves; optimization audits. Replaces the four former partial notions.
+
+## Resolved (previously open) decisions
+
+- **Category** → owned by the new `category/` context (was "open").
+- **Auto-confirm reconciliation** → still a Phase-2+ opt-in; bulk-confirm UX is a Tier-1
+  requirement (audit Part B #6).
+- **Net worth model** → cost + Σ unrealized gain (decided 2026-07-23).
+- **Timezone/FY** → owner-local Asia/Kolkata; Apr–Mar Financial Year is a first-class period.
+
+## Still open / deferred (roadmap)
+
+- Full **loans/liabilities**, **goals**, **tax engine**, **AI copilot**, **AA ingestion**,
+  **auth/MFA + encryption-at-rest + export/deletion/backup** — all in the audit doc's Tier 2/3.
+- External price feeds & non-CSV import adapters — designed, deferred, additive.
