@@ -2,8 +2,8 @@
 
 You are picking up **Midas**, a personal financial **decision-support system** (ledger-first
 double-entry; NOT an expense tracker). Single-user first, architected to launch multi-user
-later. This repo is currently **design-complete and pre-build** — no application code exists
-yet; the deliverables so far are the design docs under `docs/superpowers/`.
+later. The design is complete and **Phase 0 implementation has begun**. Production application
+code lives under `src/`; the statement-parser research remains isolated under `prototypes/`.
 
 **Read `docs/superpowers/HANDOFF.md` first** — it is the point-in-time status (what's done,
 what's held, open decisions, next steps). This file is the durable orientation.
@@ -48,3 +48,26 @@ The design process is: **requirements → HLD/ADRs → per-phase LLD → per-pha
 - Branch off `main` for work; do not commit directly to `main` for feature work.
 - Conventional-commit style messages (`feat(ledger): …`, `docs: …`).
 - Keep files focused and small; follow the module boundaries in the HLD component view — cross-context calls go through the public API interface only, never another context's internals.
+
+## Project Discovery
+
+- Production layout: `src/main` (Spring application); `src/test` (JUnit/Testcontainers tests).
+- Production commands: `./gradlew test` (tests); `./gradlew build` (build); `./gradlew bootRun` (local application).
+
+### Statement-parser prototype
+
+- Root: `prototypes/statement-parsers`
+- Language: Python 3.11+
+- Packaging: setuptools via `pyproject.toml`; runtime dependencies are pdfplumber and pypdf.
+- Test: `PYTHONPATH=src python3 -m unittest discover -s tests -v`
+- Run: `PYTHONPATH=src python3 -m statement_parser.cli ...`
+
+## Planning location
+
+Active maps, tickets, specs, designs and implementation plans live in
+`~/repositories/portfolio-planning`. Do not create new planning directories or planning documents
+in this repository.
+
+- Read `~/repositories/portfolio-planning/AGENTS.md` before planning.
+- Run `~/repositories/portfolio-planning/capabilities/work/task status` before claiming work.
+- Promote only accepted specs/ADRs here, under `docs/`; active planning stays central.
