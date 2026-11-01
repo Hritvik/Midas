@@ -1,0 +1,16 @@
+spring:
+  application:
+    name: midas
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/midas}
+    username: ${DB_USER:midas}
+    password: ${DB_PASSWORD:midas}
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health

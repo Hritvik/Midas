@@ -44,6 +44,10 @@ The full design chain is done and committed **except** the last two steps before
 2. **UX foundation pass** (journeys + low-fi wireframes for ~6 core screens) — undecided whether to run it **in parallel** with Phase 1 LLD (recommended — it validates the Phase 3 read-API shapes) or sequentially.
 3. **Deferred stack deliberations:** frontend stack (state, data-fetching, component/design system, charts) before the UX pass / Phase 3; infra/deploy/observability/auth/secrets before first deploy / Phase 6. The user's environment is GCP + Grafana + ArgoCD — likely relevant then.
 4. **Security build-out** (auth/MFA, encryption-at-rest, export/deletion/backup) is architected in HLD §8 but needs its own phase before launch; the deletion-vs-append-only resolution (crypto-shredding) is a candidate ADR-011 to firm up.
+5. **Investment Decisioning proposal** — `specs/2026-08-01-investment-decisioning-proposal.md`
+   proposes a strategy-neutral `investmentdecisioning/` capability, with reusable market data
+   and Dip Radar as its first strategy. It is intentionally unratified: resolve the listed
+   boundary and policy decisions before changing the north-star context map, HLD, or roadmap.
 
 ## Recommended next steps (in order)
 

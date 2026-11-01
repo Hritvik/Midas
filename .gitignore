@@ -5,3 +5,8 @@ build/
 *.iml
 node_modules/
 .DS_Store
+
+# Prototype generated output: bank statements + parsed JSON (never commit)
+prototypes/**/output/
+__pycache__/
+*.pyc

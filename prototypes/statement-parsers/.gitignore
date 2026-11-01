@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.coverage
+dist/
+*.egg-info/
+output/
+.env
+.env.*
+oauth-credentials*.json
+oauth-token*.json
